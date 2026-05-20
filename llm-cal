@@ -1,0 +1,169 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# dependencies = ["anthropic"]
+# ///
+
+import os
+import sys
+import datetime
+import json
+import shutil
+from anthropic import Anthropic
+
+# 自动获取当前日期
+NOW = datetime.datetime.now()
+TODAY_STR = NOW.strftime("%m/%d/%Y")
+
+# 获取 API Key (为了分发安全，移除了硬编码的 Key)
+API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+if not API_KEY:
+    print("❌ 错误: 找不到 Anthropic API Key。")
+    print("请先执行以下命令设置环境变量，或将其加入您的 ~/.bashrc 中：")
+    print("export ANTHROPIC_API_KEY='sk-ant-xxxxxxxxxxxx'")
+    sys.exit(1)
+
+CAL_DIR = os.path.expanduser("~/.local/share/calcurse")
+BACKUP_DIR = os.path.join(CAL_DIR, "backups")
+CAL_APTS = os.path.join(CAL_DIR, "apts")
+CAL_TODO = os.path.join(CAL_DIR, "todo")
+
+def create_backup():
+    if not os.path.exists(BACKUP_DIR):
+        os.makedirs(BACKUP_DIR)
+    
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    for f in ["apts", "todo"]:
+        src = os.path.join(CAL_DIR, f)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(BACKUP_DIR, f"{f}_{timestamp}.bak"))
+
+def main():
+    if len(sys.argv) < 2:
+        print("用法示例:")
+        print("  llm-cal \"明天下午三点开会\"")
+        print("  llm-cal \"撤销\" (查看备份列表)")
+        sys.exit(1)
+
+    user_input = sys.argv[1]
+    
+    if user_input == "撤销" or "备份" in user_input:
+        if os.path.exists(BACKUP_DIR):
+            backups = sorted(os.listdir(BACKUP_DIR), reverse=True)
+            print("最近的备份文件 (存放在 ~/.local/share/calcurse/backups/):")
+            for b in backups[:10]:
+                print(f"  - {b}")
+            print("\n如需恢复，请手动执行: cp ~/.local/share/calcurse/backups/文件名 ~/.local/share/calcurse/对应文件")
+        else:
+            print("尚未创建任何备份。")
+        return
+
+    client = Anthropic(api_key=API_KEY)
+
+    current_apts = ""
+    if os.path.exists(CAL_APTS):
+        with open(CAL_APTS, "r") as f:
+            current_apts = f.read().strip()
+            
+    current_todo = ""
+    if os.path.exists(CAL_TODO):
+        with open(CAL_TODO, "r") as f:
+            current_todo = f.read().strip()
+
+    prompt = f"""
+你是一个终端日历和任务 (calcurse) 助手。今天是 {TODAY_STR} ({NOW.strftime("%A")})。
+
+【当前日程列表 (APTS)】
+{current_apts if current_apts else "（无日程）"}
+
+【当前待办事项 (TODO)】
+{current_todo if current_todo else "（无待办）"}
+
+请分析用户的意图，并严格返回一个 JSON 数组（Array）。即使只有一个操作，也要放在数组里。不要有任何 markdown 标记或文本。
+
+支持的操作：
+- {{"target": "apts", "action": "add", "data": "..."}}
+- {{"target": "apts", "action": "delete", "data": "..."}}
+- {{"target": "apts", "action": "modify", "old_data": "...", "new_data": "..."}}
+- {{"target": "apts", "action": "clear_all"}}
+- {{"target": "todo", "action": "add", "data": "..."}}
+- {{"target": "todo", "action": "delete", "data": "..."}}
+- {{"target": "todo", "action": "clear_all"}}
+
+用户输入: "{user_input}"
+"""
+
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        result_text = response.content[0].text.strip()
+        if result_text.startswith("```json"): result_text = result_text[7:]
+        if result_text.startswith("```"): result_text = result_text[3:]
+        if result_text.endswith("```"): result_text = result_text[:-3]
+            
+        result_json = json.loads(result_text.strip())
+        if isinstance(result_json, dict):
+            result_json = [result_json]
+            
+        # 备份
+        needs_backup = any(obj.get("action") in ["delete", "clear_all", "modify"] for obj in result_json)
+        if needs_backup:
+            create_backup()
+
+        os.makedirs(CAL_DIR, exist_ok=True)
+
+        for action_obj in result_json:
+            target = action_obj.get("target")
+            action = action_obj.get("action")
+            if not target or not action: continue
+                
+            target_file = CAL_APTS if target == "apts" else CAL_TODO
+            target_name = "日程" if target == "apts" else "待办"
+
+            if action == "add":
+                data = action_obj.get("data", "")
+                with open(target_file, "a") as f:
+                    f.write(data + "\n")
+                print(f"已添加{target_name}: {data}")
+            elif action == "clear_all":
+                open(target_file, 'w').close()
+                print(f"已清空所有{target_name}！(已自动备份)")
+            elif action == "delete":
+                data = action_obj.get("data", "")
+                if os.path.exists(target_file):
+                    with open(target_file, "r") as f:
+                        lines = f.readlines()
+                    with open(target_file, "w") as f:
+                        deleted = False
+                        for line in lines:
+                            if line.strip() == data.strip():
+                                deleted = True
+                                continue
+                            f.write(line)
+                    if deleted:
+                        print(f"已删除{target_name}: {data} (已自动备份)")
+            elif action == "modify" and target == "apts":
+                old_data = action_obj.get("old_data", "")
+                new_data = action_obj.get("new_data", "")
+                if os.path.exists(target_file):
+                    with open(target_file, "r") as f:
+                        lines = f.readlines()
+                    found = False
+                    with open(target_file, "w") as f:
+                        for line in lines:
+                            if line.strip() == old_data.strip():
+                                f.write(new_data + "\n")
+                                found = True
+                            else:
+                                f.write(line)
+                    if found:
+                        print(f"已修改日程 (已自动备份)！\n新: {new_data}")
+
+    except Exception as e:
+        print(f"执行失败: {e}")
+
+if __name__ == "__main__":
+    main()
